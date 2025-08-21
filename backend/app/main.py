@@ -13,6 +13,47 @@ from datetime import datetime
 import csv
 from typing import List, Dict
 
+# --- upload config ---
+ALLOWED_EXTS = {'.csv', '.xlsx', '.xlsm'}
+MAX_UPLOAD_MB = 1024  # 1 GB ceiling so 253 MB is fine
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB chunks
+
+import pathlib
+import uuid
+from fastapi import HTTPException, UploadFile, File
+
+def _validate_ext(filename: str):
+    ext = pathlib.Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file extension '{ext}'. Allowed: {sorted(ALLOWED_EXTS)}"
+        )
+    return ext
+
+def _stream_save(upload_file, dest_path: str, max_bytes: int) -> int:
+    """Save file to disk in CHUNK_SIZE blocks; return total bytes written."""
+    total = 0
+    with open(dest_path, 'wb') as out:
+        while True:
+            chunk = upload_file.file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                out.close()
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Max {MAX_UPLOAD_MB} MB."
+                )
+            out.write(chunk)
+    return total
+
+
 app = FastAPI()
 
 # -------------------------------------------------------------------
@@ -81,6 +122,11 @@ def init_db():
                 UNIQUE(user_id, dataset_id, question_id)
             )
         """)
+
+        # --- indexes ---
+        c.execute("CREATE INDEX IF NOT EXISTS idx_raw_rows_dataset_qid  ON raw_rows(dataset_id, QuestionID);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_raw_rows_dataset_qtxt ON raw_rows(dataset_id, QuestionTxt);")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sel_user_ds_qid     ON selections(user_id, dataset_id, question_id);")
 
         conn.commit()
 
@@ -195,10 +241,16 @@ def _ingest_rows(dataset_id: str, rows: List[Dict[str, str]]) -> int:
 # -------------------------------------------------------------------
 @app.post("/datasets/upload")
 async def upload_dataset(file: UploadFile = File(...)):
+    # 1) Validate extension
+    ext = _validate_ext(file.filename)
+
+    # 2) Build stored path with UUID prefix
     dataset_id = str(uuid.uuid4())
-    original_name = file.filename
-    stored_name = f"{dataset_id}_{original_name}"
+    stored_name = f"{dataset_id}_{file.filename}"
     stored_path = os.path.join(UPLOADS_DIR, stored_name)
+
+    # 3) Stream save (1 GB ceiling so 253 MB is fine)
+    _ = _stream_save(file, stored_path, MAX_UPLOAD_MB * 1024 * 1024)
 
     # Save file
     with open(stored_path, "wb") as f:

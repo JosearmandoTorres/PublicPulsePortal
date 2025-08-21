@@ -1,204 +1,217 @@
-'use client';
+"use client";
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from "react";
 
-const DEV_USER = 'jose@dev';
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+const USER_ID = "jose@dev"; // dev-mode user
 
-type DatasetItem = { id: string; filename: string; uploaded_at: string };
-type SelItem = { question_id: string; created_at: string };
+type Selection = { user_id: string; dataset_id: string; question_id: string; created_at: string };
 type Block = {
+  dataset_id: string;
   question_id: string;
   question_text: string;
-  metadata: {
-    ReleaseDate?: string;
-    SurveyOrg?: string;
-    SurveySponsor?: string;
-    Country?: string;
-    SampleSize?: string;
-    SampleDesc?: string;
-    Link?: string;
-  };
-  responses: { RespTxt: string; value: string }[];
+  metadata?: Record<string, any>;
+  responses: Array<{ RespTxt: string; RespPct: string }>;
 };
+type BlocksResponse = { total: number; items: Block[] };
 
 export default function WorkspacePage() {
-  const [dataset, setDataset] = useState<DatasetItem | null>(null);
-  const [selections, setSelections] = useState<SelItem[]>([]);
-  const [blocks, setBlocks] = useState<Block[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [err, setErr] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selections, setSelections] = useState<Selection[]>([]);
+  const [blocksByDataset, setBlocksByDataset] = useState<Record<string, Block[]>>({});
 
-  // Remove API + state update
-  async function removeFromWorkspace(datasetId: string, questionId: string) {
-    const url = `${API}/selections?user_id=${encodeURIComponent(
-      DEV_USER
-    )}&dataset_id=${encodeURIComponent(datasetId)}&question_id=${encodeURIComponent(
-      questionId
-    )}`;
-    await fetch(url, { method: 'DELETE' });
-    setBlocks((prev) => prev.filter((b) => b.question_id !== questionId));
-    setSelections((prev) => prev.filter((s) => s.question_id !== questionId));
-  }
-
-  function confirmAndRemove(datasetId: string, questionId: string) {
-    if (!window.confirm('Remove this question from your workspace?')) return;
-    void removeFromWorkspace(datasetId, questionId);
-  }
-
+  // Fetch all selections across datasets
   useEffect(() => {
-    let ignore = false;
-    async function run() {
-      setLoading(true);
-      setErr('');
-      try {
-        // 1) Pick the single/most-recent dataset
-        const dsRes = await fetch(`${API}/datasets?limit=200&offset=0`, { cache: 'no-store' });
-        if (!dsRes.ok) throw new Error(`Datasets HTTP ${dsRes.status}`);
-        const dsData = (await dsRes.json()) as { items: DatasetItem[] };
+  let cancelled = false;
 
-        if (!dsData.items || dsData.items.length === 0) {
-          throw new Error('No dataset found. Upload one first at /upload.');
+  async function fetchAllSelectionsOrFallback(): Promise<Selection[]> {
+  // Try the fast path first
+  const selRes = await fetch(`${API}/selections/all?user_id=${encodeURIComponent(USER_ID)}`, { cache: "no-store" });
+  if (selRes.ok) return selRes.json();
+
+  // Fallback: enumerate datasets, then fetch per-dataset selections
+  const dsRes = await fetch(`${API}/datasets?limit=1000&offset=0`, { cache: "no-store" });
+  if (!dsRes.ok) throw new Error(`datasets failed: ${dsRes.status}`);
+
+  const dsJson = await dsRes.json();
+  // Handle both shapes: array OR { items: [...] }
+  const datasets: Array<{ id: string }> = Array.isArray(dsJson)
+    ? dsJson
+    : (Array.isArray(dsJson?.items) ? dsJson.items : []);
+
+  if (!datasets.length) return [];
+
+  const all: Selection[] = [];
+  for (const ds of datasets) {
+    if (!ds?.id) continue;
+    const url = `${API}/selections?user_id=${encodeURIComponent(USER_ID)}&dataset_id=${encodeURIComponent(ds.id)}`;
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) continue; // skip datasets without selections
+    const part: Selection[] = await r.json();
+    if (Array.isArray(part) && part.length) all.push(...part);
+    // yield for responsiveness
+    await new Promise((res) => setTimeout(res, 0));
+  }
+  return all;
+}
+
+  async function run() {
+    setLoading(true);
+    setError(null);
+    try {
+      const sel = await fetchAllSelectionsOrFallback();
+      if (cancelled) return;
+      setSelections(sel);
+
+      // Group selected question_ids by dataset_id
+      const byDataset = sel.reduce<Record<string, Set<string>>>((acc, s) => {
+        if (!acc[s.dataset_id]) acc[s.dataset_id] = new Set();
+        acc[s.dataset_id].add(s.question_id);
+        return acc;
+      }, {});
+
+      // For each dataset, fetch blocks and filter to selected question_ids
+      const out: Record<string, Block[]> = {};
+      for (const [dataset_id, qidSet] of Object.entries(byDataset)) {
+        const need = new Set(qidSet);
+        const found: Record<string, Block> = {};
+        let offset = 0;
+        const limit = 500;
+        let total = Infinity;
+
+        while (offset < total && need.size > 0) {
+          const url = `${API}/questions/blocks?dataset_id=${encodeURIComponent(dataset_id)}&limit=${limit}&offset=${offset}`;
+          const r = await fetch(url, { cache: "no-store" });
+          if (!r.ok) throw new Error(`blocks fetch failed (${dataset_id}): ${r.status}`);
+          const data: BlocksResponse = await r.json();
+          total = data.total ?? 0;
+
+          for (const b of data.items) {
+            if (need.has(b.question_id)) {
+              found[b.question_id] = b;
+              need.delete(b.question_id);
+            }
+          }
+          offset += limit;
+          await new Promise((res) => setTimeout(res, 0));
         }
 
-        const pick = [...dsData.items].sort((a, b) =>
-          (b.uploaded_at || '').localeCompare(a.uploaded_at || '')
-        )[0];
-
-        if (ignore) return;
-        setDataset(pick);
-
-        // 2) Get selections for this user on that dataset
-        const selRes = await fetch(
-          `${API}/selections?user_id=${encodeURIComponent(DEV_USER)}&dataset_id=${encodeURIComponent(
-            pick.id
-          )}`
-        );
-        if (!selRes.ok) throw new Error(`Selections HTTP ${selRes.status}`);
-        const sel = (await selRes.json()) as { items: SelItem[] };
-        if (ignore) return;
-        setSelections(sel.items);
-
-        // 3) Fetch blocks for that dataset and filter to selected ids
-        const blocksRes = await fetch(
-          `${API}/questions/blocks?dataset_id=${encodeURIComponent(pick.id)}&limit=2000&offset=0`
-        );
-        if (!blocksRes.ok) throw new Error(`Blocks HTTP ${blocksRes.status}`);
-        const all = (await blocksRes.json()) as { items: Block[] };
-        const selectedIds = new Set(sel.items.map((s) => s.question_id));
-        if (ignore) return;
-        setBlocks(all.items.filter((b) => selectedIds.has(b.question_id)));
-      } catch (e: any) {
-        if (!ignore) setErr(e?.message || 'Failed to load workspace');
-      } finally {
-        if (!ignore) setLoading(false);
+        out[dataset_id] = Object.values(found).sort((a, b) => a.question_id.localeCompare(b.question_id));
       }
+
+      if (!cancelled) setBlocksByDataset(out);
+    } catch (e: any) {
+      if (!cancelled) setError(e?.message || String(e));
+    } finally {
+      if (!cancelled) setLoading(false);
     }
-    void run();
-    return () => {
-      ignore = true;
-    };
-  }, []);
+  }
+
+  run();
+  return () => { cancelled = true; };
+}, []);
+
+  const totalSelected = selections.length;
+  const datasetOrder = useMemo(
+    () => Object.keys(blocksByDataset).sort(),
+    [blocksByDataset]
+  );
+
+  async function removeSelection(dataset_id: string, question_id: string) {
+    if (!confirm("Remove this block from your workspace?")) return;
+    const params = new URLSearchParams({
+      user_id: USER_ID,
+      dataset_id,
+      question_id,
+    }).toString();
+    const r = await fetch(`${API}/selections?${params}`, { method: "DELETE" });
+    if (!r.ok) {
+      alert(`Failed to remove: ${r.status}`);
+      return;
+    }
+    // Optimistic update: drop from state
+    setSelections((prev) => prev.filter(s => !(s.dataset_id === dataset_id && s.question_id === question_id)));
+    setBlocksByDataset((prev) => {
+      const copy = { ...prev };
+      copy[dataset_id] = (copy[dataset_id] || []).filter(b => b.question_id !== question_id);
+      return copy;
+    });
+  }
 
   return (
-  <main
-    style={{
-      maxWidth: 1000,
-      margin: '40px auto',
-      padding: 16,
-      fontFamily: 'ui-sans-serif, system-ui',
-    }}
-  >
-    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700 }}>Workspace</h1>
-      <a href="/datasets" style={{ color: '#2563eb', textDecoration: 'underline' }}>
-  ← Back to Database
-</a>
-    </div>
-
-    {dataset && (
-      <div style={{ margin: '8px 0 16px', color: '#666' }}>
-        Dataset: <code>{dataset.id}</code> · File: <b>{dataset.filename}</b> · Selected:{' '}
-        <b>{selections.length}</b>
+    <div className="p-6 space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">Workspace</h1>
+        <a href="/datasets" className="underline">Back to Database</a>
       </div>
-    )}
 
-    {err && <div style={{ color: 'tomato', marginBottom: 12 }}>Error: {err}</div>}
-    {loading && <div>Loading…</div>}
+      {loading && <div>Loading your selections…</div>}
+      {error && <div className="text-red-600">Error: {error}</div>}
 
-    {!loading && !err && blocks.length === 0 && (
-      <div style={{ color: '#666' }}>
-        No selections yet. Go back to the Database and click “+ Add” on a block.
-      </div>
-    )}
+      {!loading && !error && (
+        <>
+          <div className="text-sm text-gray-600">
+            {totalSelected === 0 ? "No selections yet." : `${totalSelected} item(s) selected across ${datasetOrder.length} dataset(s).`}
+          </div>
 
-      {blocks.map((b) => (
-<div
-  key={b.question_id}
-  style={{
-    border: '1px solid #e5e7eb',
-    borderRadius: 14,
-    padding: 12,
-    marginBottom: 12,
-  }}
->
-  {/* Title + metadata */}
-  <div>
-    <div style={{ fontWeight: 600 }}>{b.question_text || '(no question text)'}</div>
-    <div style={{ fontSize: 12, color: '#6b7280', marginTop: 2 }}>
-      {b.metadata.ReleaseDate && <>📅 {b.metadata.ReleaseDate} · </>}
-      {b.metadata.SurveyOrg && <>🏛 {b.metadata.SurveyOrg} · </>}
-      {b.metadata.Country && <>🌐 {b.metadata.Country} · </>}
-      {b.metadata.SampleSize && <>👥 N={b.metadata.SampleSize}</>}
+          {datasetOrder.length === 0 && totalSelected > 0 && (
+            <div className="text-amber-700">
+              Selections exist but their blocks weren’t found. Try refreshing or increasing the page limit.
+            </div>
+          )}
+
+          <div className="space-y-10">
+            {datasetOrder.map((dsid) => {
+              const items = blocksByDataset[dsid] || [];
+              return (
+                <section key={dsid} className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="text-lg font-medium">Dataset</div>
+                    <code className="px-2 py-1 rounded bg-gray-100 text-gray-800 text-xs">{dsid}</code>
+                    <span className="text-sm text-gray-600">· {items.length} item(s)</span>
+                  </div>
+
+                  {items.length === 0 ? (
+                    <div className="text-sm text-gray-500">No blocks resolved for this dataset (yet).</div>
+                  ) : (
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                      {items.map((b) => (
+                        <div key={`${b.dataset_id}:${b.question_id}`} className="rounded-2xl shadow p-4 border border-gray-200 flex flex-col">
+                          <div className="mb-2 text-xs text-gray-500">
+                            <span className="font-mono">QID:</span> {b.question_id}
+                          </div>
+                          <div className="font-semibold mb-2">{b.question_text || "(no question text)"}</div>
+                          <div className="flex-1">
+                            <ul className="text-sm list-disc pl-5 space-y-1">
+                              {b.responses.slice(0, 6).map((r, i) => (
+                                <li key={i}>
+                                  {r.RespTxt} — {r.RespPct}
+                                </li>
+                              ))}
+                              {b.responses.length > 6 && (
+                                <li className="text-gray-500">…{b.responses.length - 6} more</li>
+                              )}
+                            </ul>
+                          </div>
+                          <div className="mt-4 flex justify-end">
+                            <button
+                              onClick={() => removeSelection(b.dataset_id, b.question_id)}
+                              className="px-3 py-1.5 text-sm rounded-xl bg-red-600 text-white hover:bg-red-700"
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
-  </div>
-
-  {/* Responses table */}
-  <div style={{ marginTop: 6, overflow: 'auto' }}>
-    <table style={{ minWidth: 480, width: '100%' }}>
-      <thead>
-        <tr>
-          <th align="left">Response</th>
-          <th align="left">Value</th>
-        </tr>
-      </thead>
-      <tbody>
-        {b.responses.map((r, i) => (
-          <tr key={i}>
-            <td>{r.RespTxt}</td>
-            <td style={{ fontFamily: 'monospace' }}>{r.value}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  </div>
-
-  {/* Question ID */}
-  <div style={{ marginTop: 6, fontSize: 12, color: '#6b7280' }}>
-    QuestionID: {b.question_id}
-  </div>
-
-  {/* Bottom Remove button */}
-  <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
-    <button
-      onClick={() => dataset && confirmAndRemove(dataset.id, b.question_id)}
-      style={{
-        backgroundColor: '#ef4444', // red
-        color: '#ffffff',
-        border: 'none',
-        borderRadius: 8,
-        padding: '6px 10px',
-        fontSize: 12,
-        cursor: 'pointer',
-      }}
-      title="Remove from workspace"
-    >
-      Remove
-    </button>
-  </div>
-
-  </div>
-))}
-    </main>
   );
 }
