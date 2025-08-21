@@ -1,5 +1,5 @@
 "use client";
-
+import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
@@ -20,6 +20,92 @@ export default function WorkspacePage() {
   const [error, setError] = useState<string | null>(null);
   const [selections, setSelections] = useState<Selection[]>([]);
   const [blocksByDataset, setBlocksByDataset] = useState<Record<string, Block[]>>({});
+
+  // BEGIN multi-select state
+const [selectedIds, setSelectedIds] = useState<string[]>([]);
+
+const toggleSelected = (qid: string) => {
+  setSelectedIds(prev =>
+    prev.includes(qid) ? prev.filter(id => id !== qid) : [...prev, qid]
+  );
+};
+// END multi-select state
+
+// BEGIN drag-and-drop (local reordering)
+const [dragSrc, setDragSrc] = useState<{ dsid: string | null; qid: string | null }>({ dsid: null, qid: null });
+const [dragOverQid, setDragOverQid] = useState<string | null>(null);
+const [dragPosition, setDragPosition] = useState<"above" | "below" | null>(null);
+
+
+function onDragStartCard(dsid: string, qid: string) {
+  setDragSrc({ dsid, qid });
+}
+
+function onDragOverCard(e: React.DragEvent<HTMLDivElement>, qid?: string) {
+  e.preventDefault();
+  if (!qid) return;
+
+  const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+  const midpoint = rect.top + rect.height / 2;
+  const cursorY = e.clientY;
+
+  const nextPos: "above" | "below" = cursorY < midpoint ? "above" : "below";
+
+  // only update when something changes to avoid re-render jitter
+  if (dragOverQid !== qid) setDragOverQid(qid);
+  if (dragPosition !== nextPos) setDragPosition(nextPos);
+}
+
+
+
+function onDropCard(dsid: string, targetQid: string) {
+  if (!dragSrc.dsid || !dragSrc.qid) return;
+  if (dragSrc.dsid !== dsid) return; // only within same dataset
+
+  setBlocksByDataset(prev => {
+  const list = prev[dsid] ? [...prev[dsid]] : [];
+  const fromIdx = list.findIndex(b => String(b.question_id) === String(dragSrc.qid));
+  const toIdx   = list.findIndex(b => String(b.question_id) === String(targetQid));
+  if (fromIdx < 0 || toIdx < 0) return prev;
+
+  const moved = list[fromIdx];
+  list.splice(fromIdx, 1);
+
+  const targetAfter = fromIdx < toIdx ? toIdx - 1 : toIdx;
+  const insertIdx   = dragPosition === "below" ? targetAfter + 1 : targetAfter;
+  const idx         = Math.max(0, Math.min(list.length, insertIdx));
+  list.splice(idx, 0, moved);
+
+  const next = { ...prev, [dsid]: list };
+
+  // save order for this dataset (persist across refresh)
+  try {
+    const order = list.map(b => String(b.question_id));
+    localStorage.setItem(`ppp_order_${dsid}`, JSON.stringify(order));
+  } catch (_) {
+    /* ignore storage errors in dev */
+  }
+
+  return next;
+});
+
+
+  // reset drag state
+  setDragSrc({ dsid: null, qid: null });
+  setDragOverQid(null);
+  setDragPosition(null);
+}
+
+function onDragLeaveCard(e: React.DragEvent<HTMLDivElement>, qid?: string) {
+  // Only clear if we’re leaving the currently hovered card
+  if (!qid) return;
+  if (dragOverQid === qid) {
+    setDragOverQid(null);
+    setDragPosition(null);
+  }
+}
+// END drag-and-drop (local reordering)
+
 
   // Fetch all selections across datasets
   useEffect(() => {
@@ -161,6 +247,122 @@ async function removeSelection(dataset_id: string, question_id: string) {
     return copy;
   });
 }
+
+// Map question_id -> dataset_id using the selections we loaded
+function datasetForQid(qid: string): string | null {
+  const hit = selections.find(s => String(s.question_id) === String(qid));
+  return hit ? String(hit.dataset_id) : null;
+}
+
+async function removeSelected() {
+  if (selectedIds.length === 0) return;
+  if (!confirm(`Remove ${selectedIds.length} selected item(s) from your workspace?`)) return;
+
+  // Build requests in parallel
+  const jobs = selectedIds.map(qid => {
+    const ds = datasetForQid(qid);
+    if (!ds) return Promise.resolve({ qid, ok: false, status: 0, text: "dataset_id not found" });
+
+    const params = new URLSearchParams({
+      user_id: String(DEV_USER).trim(),
+      dataset_id: ds,
+      question_id: String(qid).trim(),
+    });
+
+    return fetch(`${API}/selections?${params.toString()}`, { method: "DELETE" })
+      .then(async (res) => ({
+        qid,
+        ok: res.ok || res.status === 204,
+        status: res.status,
+        text: (await res.text()) || "",
+        ds,
+      }))
+      .catch(err => ({ qid, ok: false, status: 0, text: String(err), ds }));
+  });
+
+  const results = await Promise.all(jobs);
+  const failures = results.filter(r => !r.ok);
+
+  // Optimistic local state updates for all successful removals
+  const removedQids = new Set(results.filter(r => r.ok).map(r => String(r.qid)));
+
+  if (removedQids.size > 0) {
+    // 1) selections
+    setSelections(prev => prev.filter(s => !removedQids.has(String(s.question_id))));
+
+    // 2) blocksByDataset
+    setBlocksByDataset(prev => {
+      const copy = { ...prev };
+      for (const ds of Object.keys(copy)) {
+        const filtered = (copy[ds] || []).filter(b => !removedQids.has(String(b.question_id)));
+        if (filtered.length > 0) copy[ds] = filtered;
+        else delete copy[ds];
+      }
+      return copy;
+    });
+
+    // 3) clear those checkboxes
+    setSelectedIds(prev => prev.filter(qid => !removedQids.has(String(qid))));
+  }
+
+  if (failures.length > 0) {
+    const first = failures[0];
+    alert(`Some items failed to remove (${failures.length}). Example: qid=${first.qid}, status=${first.status}, msg=${first.text}`);
+  }
+}
+
+async function clearAll() {
+  if (selections.length === 0) return;
+  if (!confirm(`Clear ALL ${selections.length} item(s) from your workspace? This will remove every item.`)) return;
+
+  const uid = String(DEV_USER).trim();
+
+  // Build a unique list of (dataset_id, question_id) pairs from current selections
+  const pairs = selections.map(s => ({
+    ds: String(s.dataset_id).trim(),
+    qid: String(s.question_id).trim(),
+  }));
+
+  // Fire DELETEs in parallel
+  const jobs = pairs.map(({ ds, qid }) => {
+    const params = new URLSearchParams({ user_id: uid, dataset_id: ds, question_id: qid });
+    return fetch(`${API}/selections?${params.toString()}`, { method: "DELETE" })
+      .then(async (res) => ({
+        ds, qid, ok: res.ok || res.status === 204, status: res.status, text: (await res.text()) || "",
+      }))
+      .catch(err => ({ ds, qid, ok: false, status: 0, text: String(err) }));
+  });
+
+  const results = await Promise.all(jobs);
+  const failures = results.filter(r => !r.ok);
+
+  // Optimistic local state: nuke all if most succeeded; otherwise remove only successes
+  const succeeded = new Set(results.filter(r => r.ok).map(r => `${r.ds}:${r.qid}`));
+
+  if (succeeded.size > 0) {
+    setSelections(prev => prev.filter(s => !succeeded.has(`${String(s.dataset_id)}:${String(s.question_id)}`)));
+
+    setBlocksByDataset(prev => {
+      const copy = { ...prev };
+      for (const ds of Object.keys(copy)) {
+        const filtered = (copy[ds] || []).filter(b => !succeeded.has(`${String(ds)}:${String(b.question_id)}`));
+        if (filtered.length > 0) copy[ds] = filtered;
+        else delete copy[ds];
+      }
+      return copy;
+    });
+
+    setSelectedIds([]); // clear any checked boxes
+  }
+
+  if (failures.length > 0) {
+    const first = failures[0];
+    alert(`Some items failed to remove (${failures.length}). Example: ds=${first.ds}, qid=${first.qid}, status=${first.status}, msg=${first.text}`);
+  }
+}
+
+
+
   return (
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
@@ -174,6 +376,38 @@ async function removeSelection(dataset_id: string, question_id: string) {
       {!loading && !error && (
         <>
           <div className="text-sm text-gray-600">
+              {/* Bulk actions toolbar */}
+    <div className="mt-3 flex items-center gap-3">
+  <button
+    onClick={removeSelected}
+    disabled={selectedIds.length === 0}
+    className={`text-sm rounded-xl border px-3 py-1 ${
+      selectedIds.length === 0 ? "opacity-50 cursor-not-allowed" : ""
+    }`}
+    title={selectedIds.length === 0 ? "Select items to enable" : `Remove ${selectedIds.length} selected`}
+  >
+    Remove Selected
+  </button>
+
+  <button
+    onClick={clearAll}
+    disabled={totalSelected === 0}
+    className={`text-sm rounded-xl border px-3 py-1 ${
+      totalSelected === 0 ? "opacity-50 cursor-not-allowed" : ""
+    }`}
+    title={totalSelected === 0 ? "No items to clear" : `Clear all (${totalSelected})`}
+  >
+    Clear All
+  </button>
+
+  {selectedIds.length > 0 && (
+    <span className="text-xs text-gray-600">
+      {selectedIds.length} selected
+    </span>
+  )}
+</div>
+
+
             {totalSelected === 0 ? "No selections yet." : `${totalSelected} item(s) selected across ${datasetOrder.length} dataset(s).`}
           </div>
 
@@ -194,62 +428,96 @@ async function removeSelection(dataset_id: string, question_id: string) {
                     <span className="text-sm text-gray-600">· {items.length} item(s)</span>
                   </div>
 
-                  {items.length === 0 ? (
+                 {items.length === 0 ? (
   <div className="text-sm text-gray-500">No blocks resolved for this dataset (yet).</div>
 ) : (
   <div className="space-y-5">
-    {items.map((b) => (
-      <div
-        key={`${b.dataset_id}:${b.question_id}`}
-        className="rounded-2xl border shadow-sm p-4"
-      >
-        <div className="mb-2 flex items-start justify-between gap-3">
-          <div>
-            <div className="text-lg font-medium">{b.question_text || "(no question text)"}</div>
-            <div className="text-xs text-gray-500 flex flex-wrap gap-2">
-              <span className="rounded-full border px-2 py-0.5">DS: {b.dataset_id}</span>
+    {items.map((b) => {
+      const qidStr = String(b.question_id);
+      const dsStr  = String(b.dataset_id);
+
+      return (
+        <div key={`${dsStr}:${qidStr}`} className="space-y-2">
+          {/* insertion line ABOVE */}
+          {dragOverQid === qidStr && dragPosition === "above" && (
+            <div className="h-0.5 bg-blue-500 rounded-full pointer-events-none" />
+          )}
+
+          {/* CARD */}
+          <div
+            className="rounded-2xl border shadow-sm p-4"
+            draggable
+            onDragStart={() => onDragStartCard(dsStr, qidStr)}
+            onDragOver={(e) => onDragOverCard(e, qidStr)}
+            onDragEnter={(e) => onDragOverCard(e, qidStr)}
+            onDragLeave={(e) => onDragLeaveCard(e, qidStr)}
+            onDrop={() => onDropCard(dsStr, qidStr)}
+            title="Drag to reorder within this dataset"
+          >
+            <div className="mb-2 flex items-start justify-between gap-3">
+              {/* LEFT: checkbox + title */}
+              <div className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={selectedIds.includes(qidStr)}
+                  onChange={() => toggleSelected(qidStr)}
+                  aria-label={`Select ${qidStr}`}
+                />
+                <div>
+                  <div className="text-lg font-medium">{b.question_text || "(no question text)"}</div>
+                  <div className="text-xs text-gray-500 flex flex-wrap gap-2">
+                    <span className="rounded-full border px-2 py-0.5">DS: {dsStr}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* RIGHT: remove button */}
+              <div className="shrink-0">
+                <button
+                  onClick={() => removeSelection(dsStr, qidStr)}
+                  className="text-sm rounded-xl border px-3 py-1"
+                  title="Remove from workspace"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-auto">
+              <table className="min-w-[480px] w-full text-sm">
+                <thead>
+                  <tr className="border-b">
+                    <th className="text-left py-2 pr-4">Response</th>
+                    <th className="text-left py-2">Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {b.responses.map((r, i) => (
+                    <tr key={i} className="border-b last:border-0">
+                      <td className="py-1 pr-4">{r.RespTxt}</td>
+                      <td className="py-1 font-mono">{(r as any).RespPct ?? (r as any).value ?? ""}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="mt-2 text-xs text-gray-500">
+              DatasetID: {dsStr} · QuestionID: {qidStr}
             </div>
           </div>
 
-          <div className="shrink-0">
-            <button
-              onClick={() => removeSelection(String(b.dataset_id), String(b.question_id))}
-              className="text-sm rounded-xl border px-3 py-1"
-              title="Remove from workspace"
-            >
-              Remove
-            </button>
-          </div>
+          {/* insertion line BELOW */}
+          {dragOverQid === qidStr && dragPosition === "below" && (
+            <div className="h-0.5 bg-blue-500 rounded-full pointer-events-none" />
+          )}
         </div>
-
-        <div className="overflow-auto">
-          <table className="min-w-[480px] w-full text-sm">
-            <thead>
-              <tr className="border-b">
-                <th className="text-left py-2 pr-4">Response</th>
-                <th className="text-left py-2">Value</th>
-              </tr>
-            </thead>
-            <tbody>
-              {b.responses.map((r, i) => (
-                <tr key={i} className="border-b last:border-0">
-                  <td className="py-1 pr-4">{r.RespTxt}</td>
-                  <td className="py-1 font-mono">{r.RespPct ?? r.value ?? ""}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <div className="mt-2 text-xs text-gray-500">
-          DatasetID: {b.dataset_id} · QuestionID: {b.question_id}
-        </div>
-      </div>
-    ))}
+      );
+    })}
   </div>
 )}
-
-                </section>
+</section>
               );
             })}
           </div>
